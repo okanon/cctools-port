@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* cctools-port: For bcmp, bzero ... */
 #include <limits.h>
 #include <ctype.h>
 #include <libc.h>
@@ -46,6 +47,7 @@
 #include "stuff/symbol_list.h"
 #include "stuff/unix_standard_mode.h"
 #include "stuff/execute.h"
+#include "stuff/write64.h"
 #ifdef TRIE_SUPPORT
 #include <mach-o/prune_trie.h>
 #endif /* TRIE_SUPPORT */
@@ -69,7 +71,9 @@ static uint32_t nflag;	/* save N_SECT global symbols */
 static uint32_t Sflag;	/* -S strip only debugger symbols N_STAB */
 static uint32_t xflag;	/* -x strip non-globals */
 static uint32_t Xflag;	/* -X strip local symbols with 'L' names */
-static uint32_t Tflag;	/* -T strip symbols that start with '__T' names */
+static uint32_t Tflag;	/* -T strip Swift symbols: symbols that start with
+                           '_$S' or '_$s' */
+static uint32_t Nflag;	/* -N strip all nlist symbols and strings */
 static uint32_t cflag;	/* -c strip section contents from dynamic libraries
 			   files to create stub libraries */
 static uint32_t no_uuid;/* -no_uuid strip LC_UUID load commands */
@@ -88,6 +92,13 @@ static uint32_t strip_all = 1;
  * This has the same effect as -r and -u.
  */
 static enum bool default_dyld_executable = FALSE;
+
+/*
+ * When the -N flag is used it may not be possible to strip all nlists because
+ * the file is not used by dyld, an MH_KEXT_BUNDLE filetype or has external
+ * relocations in the LC_DYSYMTAB.
+ */
+static enum bool strip_all_nlists = FALSE;
 #endif /* NMEDIT */
 
 /*
@@ -176,6 +187,11 @@ struct undef_map64 {
     struct nlist_64 symbol64;
 };
 static char *qsort_strings = NULL;
+
+struct strx_map {
+    uint32_t old_strx;
+    uint32_t new_strx;
+};
 #endif /* !defined(NMEDIT) */
 
 
@@ -234,6 +250,7 @@ static void check_indirect_symtab(
     uint32_t nsyms,
     char *strings,
     int32_t *missing_reloc_symbols,
+    uint32_t swift_version,
     enum byte_sex host_byte_sex);
 
 #ifndef NMEDIT
@@ -247,7 +264,9 @@ static enum bool strip_symtab(
     struct dylib_module_64 *mods64,
     uint32_t nmodtab,
     struct dylib_reference *refs,
-    uint32_t nextrefsyms);
+    uint32_t nextrefsyms,
+    uint32_t *p_swift_version,
+    enum bool *nlist_outofsync_with_dyldinfo);
 
 #ifdef TRIE_SUPPORT
 static int prune(
@@ -285,6 +304,14 @@ static enum bool symbol_pointer_used(
     uint32_t symbol_index,
     uint32_t *indirectsyms,
     uint32_t nindirectsyms);
+
+static int cmp_qsort_strx_map(
+    const struct strx_map* a,
+    const struct strx_map* b);
+
+static int cmp_bsearch_strx_map(
+    const uint32_t* old_strx,
+    const struct strx_map *strx_map);
 
 static int cmp_qsort_undef_map(
     const struct undef_map *sym1,
@@ -488,6 +515,9 @@ char *envp[])
 			    Tflag = 1;
 			    strip_all = 0;
 			    break;
+			case 'N':
+			    Nflag = 1;
+			    break;
 			case 'x':
 			    xflag = 1;
 			    strip_all = 0;
@@ -536,6 +566,13 @@ char *envp[])
 	    else
 		files_specified++;
 	}
+	/*
+	 * This allows testing of stripping all nlists and string tables.
+	 */
+#ifndef NMEDIT
+	if(getenv("STRIP_NLISTS") != NULL)
+	    Nflag = 1;
+#endif /* !defined(NMEDIT) */
 	if(args_left == 0)
 	    files_specified += argc - (i + 1);
 	
@@ -1010,8 +1047,18 @@ struct object *object)
     uint32_t k;
 #endif
     uint32_t ncmds;
+    uint32_t swift_version;
+    enum bool nlist_outofsync_with_dyldinfo;
+    uint32_t mh_flags;
+
+	if(object->mh != NULL)
+	    mh_flags = object->mh->flags;
+	else
+	    mh_flags = object->mh64->flags;
 
 	host_byte_sex = get_host_byte_sex();
+	swift_version = 0;
+	nlist_outofsync_with_dyldinfo = FALSE;
 
 	/* Don't do anything to stub dylibs which have no load commands. */
 	if(object->mh_filetype == MH_DYLIB_STUB){
@@ -1270,6 +1317,14 @@ struct object *object)
 	    default_dyld_executable = TRUE;
 	else
 	    default_dyld_executable = FALSE;
+	if(Nflag &&
+           (mh_flags & MH_DYLDLINK) == MH_DYLDLINK &&
+           object->mh_filetype != MH_KEXT_BUNDLE &&
+	   object->dyst != NULL && object->dyst->nextrel == 0)
+	    strip_all_nlists = TRUE;
+	else
+	    strip_all_nlists = FALSE;
+
 #endif /* !defined(NMEDIT) */
 
 #ifndef NMEDIT
@@ -1286,7 +1341,8 @@ struct object *object)
 		return;
 #else /* !defined(NMEDIT) */
 	    if(strip_symtab(arch, member, object, tocs, ntoc, mods, mods64,
-			    nmodtab, refs, nextrefsyms) == FALSE)
+			    nmodtab, refs, nextrefsyms, &swift_version,
+			    &nlist_outofsync_with_dyldinfo) == FALSE)
 		return;
 	    if(no_uuid == TRUE)
 		strip_LC_UUID_commands(arch, member, object);
@@ -1820,7 +1876,11 @@ struct object *object)
 			offset += object->st->nsyms * sizeof(struct nlist_64);
 		}
 		else
-		    object->st->symoff = 0;
+		    /*
+		     * This should be set to zero when nsyms is zero, but dyld
+		     * will think it is malformed.  See rdar://34465083
+		     */
+		    object->st->symoff = offset;
 
 		if(object->hints_cmd != NULL){
 		    if(object->hints_cmd->nhints != 0){
@@ -1943,7 +2003,12 @@ struct object *object)
 		    offset += object->st->strsize;
 		}
 		else
-		    object->st->stroff = 0;
+		    /*
+		     * This should be set to zero when strsize is zero, but some
+		     * tools will think it is malformed, like machocheck.  See
+		     * rdar://34729011
+		     */
+		    object->st->stroff = offset;
 
 		if(object->code_sig_cmd != NULL){
 		    offset = rnd(offset, 16);
@@ -2212,8 +2277,9 @@ struct object *object)
 		    }
 		    if(saves[relocs[i].r_symbolnum] == 0){
 			if(missing_reloc_symbols == 0){
-			    error_arch(arch, member, "symbols referenced by "
-			      "relocation entries that can't be stripped in: ");
+			    error_arch(arch, member, "error: symbols "
+			      "referenced by relocation entries that can't be "
+			      "stripped in: ");
 			    missing_reloc_symbols = 1;
 			}
 			if(object->mh != NULL){
@@ -2288,7 +2354,7 @@ struct object *object)
 			check_indirect_symtab(arch, member, object, nitems,
 			    s->reserved1, section_type, contents, symbols,
 			    symbols64, nsyms, strings, &missing_reloc_symbols,
-			    host_byte_sex);
+			    swift_version, host_byte_sex);
 			s++;
 		    }
 		}
@@ -2314,7 +2380,7 @@ struct object *object)
 			check_indirect_symtab(arch, member, object, nitems,
 			    s64->reserved1, section_type, contents, symbols,
 			    symbols64, nsyms, strings, &missing_reloc_symbols,
-			    host_byte_sex);
+			    swift_version, host_byte_sex);
 			s64++;
 		    }
 		}
@@ -2337,6 +2403,13 @@ struct object *object)
 	  )
 	    warning_arch(arch, member, "changes being made to the file will "
 		"invalidate the code signature in: ");
+
+	if(nlist_outofsync_with_dyldinfo == TRUE){
+	    if(object->mh != NULL)
+		object->mh->flags |= MH_NLIST_OUTOFSYNC_WITH_DYLDINFO;
+	    else
+		object->mh64->flags |= MH_NLIST_OUTOFSYNC_WITH_DYLDINFO;
+	}
 }
 
 /*
@@ -2456,7 +2529,7 @@ enum byte_sex host_byte_sex)
 #ifndef NMEDIT
 		if(saves[relocs[k].r_symbolnum] == 0){
 		    if(*missing_reloc_symbols == 0){
-			error_arch(arch, member, "symbols referenced by "
+			error_arch(arch, member, "error: symbols referenced by "
 			    "relocation entries that can't be stripped in: ");
 			*missing_reloc_symbols = 1;
 		    }
@@ -2585,6 +2658,7 @@ struct nlist_64 *symbols64,
 uint32_t nsyms,
 char *strings,
 int32_t *missing_reloc_symbols,
+uint32_t swift_version,
 enum byte_sex host_byte_sex)
 {
     uint32_t k, index;
@@ -2592,12 +2666,15 @@ enum byte_sex host_byte_sex)
     uint32_t n_strx, value;
     uint64_t value64;
     enum bool made_local;
-    uint32_t mh_flags;
+    uint32_t mh_flags, mh_filetype;
 
-	if(object->mh != NULL)
+	if(object->mh != NULL) {
 	    mh_flags = object->mh->flags;
-	else
+	    mh_filetype = object->mh->filetype;
+	} else {
 	    mh_flags = object->mh64->flags;
+	    mh_filetype = object->mh64->filetype;
+	}
 
 	for(k = 0; k < nitems; k++){
 	    made_local = FALSE;
@@ -2664,16 +2741,19 @@ enum byte_sex host_byte_sex)
 			saves[index] - 1;
 		}
 #else /* !defined(NMEDIT) */
-		else if(Tflag && (mh_flags & MH_DYLDLINK) == MH_DYLDLINK &&
+		else if(strip_all_nlists ||
+			(Tflag && swift_version != 0 &&
+			(mh_flags & MH_DYLDLINK) == MH_DYLDLINK &&
 	                n_strx != 0 &&
-			strncmp(strings + n_strx, "__T", 3) == 0){
+			(strncmp(strings + n_strx, "_$S", 3) == 0 ||
+			 strncmp(strings + n_strx, "_$s", 3) == 0))){
 		    object->output_indirect_symtab[reserved1 + k] =
 			    INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS;
 		    made_local = TRUE;
 		}
 		else{
 		    if(*missing_reloc_symbols == 0){
-			error_arch(arch, member, "symbols referenced by "
+			error_arch(arch, member, "error: symbols referenced by "
 			    "indirect symbol table entries that can't be "
 			    "stripped in: ");
 			*missing_reloc_symbols = 1;
@@ -2753,6 +2833,26 @@ char *dfile)
 }
 
 /*
+ * Hack needed to dig out the swift_version from (flags >> 8) & 0xff to see if
+ * non-zero to apply the -T hack for trying to removing only swift symbols that
+ * start with "_$S" and not other symbols starting with "_$S".
+ */
+struct objc_image_info {
+    uint32_t version;
+    uint32_t flags;
+};
+
+static
+void
+swap_objc_image_info(
+struct objc_image_info *o,
+enum byte_sex target_byte_sex)
+{
+        o->version = SWAP_INT(o->version);
+        o->flags = SWAP_INT(o->flags);
+}
+
+/*
  * Strip the symbol table to the level specified by the command line arguments.
  * The new symbol table is built and new_symbols is left pointing to it.  The
  * number of new symbols is left in new_nsyms, the new string table is built
@@ -2771,7 +2871,9 @@ struct dylib_module *mods,
 struct dylib_module_64 *mods64,
 uint32_t nmodtab,
 struct dylib_reference *refs,
-uint32_t nextrefsyms)
+uint32_t nextrefsyms,
+uint32_t *p_swift_version,
+enum bool *nlist_outofsync_with_dyldinfo)
 {
     uint32_t i, j, k, n, inew_syms, save_debug, missing_syms;
     uint32_t missing_symbols;
@@ -2784,7 +2886,7 @@ uint32_t nextrefsyms)
     struct segment_command_64 *sg64;
     struct section *s, **sections;
     struct section_64 *s64, **sections64;
-    uint32_t ncmds, mh_flags, s_flags, n_strx;
+    uint32_t ncmds, mh_flags, mh_filetype, s_flags, n_strx;
     struct nlist *sym;
     struct undef_map *undef_map;
     struct undef_map64 *undef_map64;
@@ -2794,7 +2896,14 @@ uint32_t nextrefsyms)
     uint32_t module_name, iextdefsym, nextdefsym, ilocalsym, nlocalsym;
     uint32_t irefsym, nrefsym;
     enum bool has_dwarf, hack_5614542;
+    uint32_t swift_version;
+    char *p_objc_image_info;
+    struct objc_image_info o;
+    struct strx_map* strx_map;
+    uint32_t strx_count;
+    uint32_t strx_uniqcount;
 
+	*nlist_outofsync_with_dyldinfo = FALSE;
 	save_debug = 0;
 	if(saves != NULL)
 	    free(saves);
@@ -2816,7 +2925,10 @@ uint32_t nextrefsyms)
 	new_nextdefsym = 0;
 	new_nundefsym = 0;
 	new_ext_strsize = 0;
-
+        strx_map = NULL;
+        strx_count = 0;
+        strx_uniqcount = 0;
+    
 	/*
 	 * If this an object file that has DWARF debugging sections to strip
 	 * then we have to run ld -r on it.  We also have to do this for
@@ -2891,6 +3003,12 @@ uint32_t nextrefsyms)
 	 */
 	saves = (int32_t *)allocate(nsyms * sizeof(int32_t));
 	bzero(saves, nsyms * sizeof(int32_t));
+    
+        /*
+         * Allocate space for the strx_map. This table will be used unique
+         * local symbol strings, reclaiming space from the file.
+         */
+        strx_map = calloc(nsyms, sizeof(*strx_map));
 
 	/*
 	 * Gather an array of section struct pointers so we can later determine
@@ -2943,10 +3061,70 @@ uint32_t nextrefsyms)
 	    lc = (struct load_command *)((char *)lc + lc->cmdsize);
 	}
 
+	if(object->mh != NULL) {
+	    mh_flags = object->mh->flags;
+	    mh_filetype = object->mh->filetype;
+	} else {
+	    mh_flags = object->mh64->flags;
+	    mh_filetype = object->mh64->filetype;
+	}
+
+	/*
+	 * Get the swift version if any if we are using the -T flag and this is
+	 * an linked image for dyld.  This is a hack to try to lessen the
+	 * chance of stripping a symbol that starts with "_$S" that is not a
+	 * swift symbol.
+	 */
+	swift_version = 0;
+	if(Tflag && (mh_flags & MH_DYLDLINK) == MH_DYLDLINK){
+	    p_objc_image_info = NULL;
+	    for(i = 0; i < nsects; i++){
+		if(object->mh != NULL){
+		    if((strcmp(sections[i]->segname, "__DATA") == 0 ||
+		        strcmp(sections[i]->segname, "__DATA_CONST") == 0 ||
+		        strcmp(sections[i]->segname, "__DATA_DIRTY") == 0) &&
+		       strncmp(sections[i]->sectname, "__objc_imageinfo", 16)
+									== 0 &&
+		       sections[i]->size >= sizeof(struct objc_image_info)) {
+			p_objc_image_info = object->object_addr +
+					    sections[i]->offset;
+			break;
+		    }
+		}
+		else{
+		    if((strcmp(sections64[i]->segname, "__DATA") == 0 ||
+		        strcmp(sections64[i]->segname, "__DATA_CONST") == 0 ||
+		        strcmp(sections64[i]->segname, "__DATA_DIRTY") == 0) &&
+		       strncmp(sections64[i]->sectname, "__objc_imageinfo", 16)
+									== 0 &&
+		       sections64[i]->size >= sizeof(struct objc_image_info)) {
+			p_objc_image_info = object->object_addr +
+					    sections64[i]->offset;
+			break;
+		    }
+		}
+	    }
+	    if(p_objc_image_info != NULL){
+		memcpy(&o, p_objc_image_info, sizeof(struct objc_image_info));
+		if(object->object_byte_sex != get_host_byte_sex())
+		    swap_objc_image_info(&o, get_host_byte_sex());
+		swift_version = (o.flags >> 8) & 0xff;
+	    }
+	}
+	*p_swift_version = swift_version;
+
+        /*
+         * Build the list of symbols to save. Also compute the space required
+         * by the external and unknown symbol strings,
+         *
+         * In order to unique local symbol strings in a reasonable amount of
+         * time-complexity, we will build a list of strx string indexes to
+         * retain in the final file. This list will be processed and measured
+         * outside of this nsyms loop.
+         */
 	for(i = 0; i < nsyms; i++){
 	    s_flags = 0;
 	    if(object->mh != NULL){
-		mh_flags = object->mh->flags;
 		n_strx = symbols[i].n_un.n_strx;
 		n_type = symbols[i].n_type;
 		n_sect = symbols[i].n_sect;
@@ -2962,7 +3140,6 @@ uint32_t nextrefsyms)
 		n_value = symbols[i].n_value;
 	    }
 	    else{
-		mh_flags = object->mh64->flags;
 		n_strx = symbols64[i].n_un.n_strx;
 		n_type = symbols64[i].n_type;
 		n_sect = symbols64[i].n_sect;
@@ -2994,12 +3171,26 @@ uint32_t nextrefsyms)
 		}
 	    }
 	    /*
-	     * If the -T flag is specified then if this is a final linked
-	     * binary never save symbols that start with "__T".
+             * If we use the -N flag to set strip all symbols in binaries used
+	     * with the dynamic linker set *nlist_outofsync_with_dyldinfo to
+	     * true.
 	     */
-	    if(Tflag && (mh_flags & MH_DYLDLINK) == MH_DYLDLINK &&
-	       n_strx != 0 && strncmp(strings + n_strx, "__T", 3) == 0){
+	    if(strip_all_nlists) {
+		*nlist_outofsync_with_dyldinfo = TRUE;
+		continue;
+	    }
+	    /*
+	     * If the -T flag is specified then if this is a final linked
+	     * binary never save symbols that start with "_$S" if the
+	     * swift version is non-zero.
+	     */
+	    if(Tflag && swift_version != 0 &&
+	       (mh_flags & MH_DYLDLINK) == MH_DYLDLINK &&
+	       n_strx != 0 &&
+               (strncmp(strings + n_strx, "_$S", 3) == 0 ||
+                strncmp(strings + n_strx, "_$s", 3) == 0)){
 		/* don't save this symbol */
+		*nlist_outofsync_with_dyldinfo = TRUE;
 		continue;
 	    }
 	    if((n_type & N_EXT) == 0){ /* local symbol */
@@ -3010,10 +3201,11 @@ uint32_t nextrefsyms)
 		if((object->mh_cputype == CPU_TYPE_X86_64 ||
 		    object->mh_cputype == CPU_TYPE_I386 ||
                     object->mh_cputype == CPU_TYPE_ARM64 ||
+                    object->mh_cputype == CPU_TYPE_ARM64_32 ||
 		    object->mh_cputype == CPU_TYPE_ARM) &&
 		   object->mh_filetype == MH_OBJECT){
 		    if(n_strx != 0)
-			new_strsize += strlen(strings + n_strx) + 1;
+                        strx_map[strx_count++].old_strx = n_strx;
 		    new_nlocalsym++;
 		    new_nsyms++;
 		    saves[i] = new_nsyms;
@@ -3054,8 +3246,8 @@ uint32_t nextrefsyms)
 				     */
 				    if(save_debug){
 					if(n_strx != 0)
-					    new_strsize += strlen(strings +
-						  	          n_strx) + 1;
+                                            strx_map[strx_count++].old_strx =
+                                                n_strx;
 					new_nlocalsym++;
 					new_nsyms++;
 					saves[i] = new_nsyms;
@@ -3069,7 +3261,7 @@ uint32_t nextrefsyms)
 			}
 			if(saves[i] == 0 && (!Sflag || save_debug)){
 			    if(n_strx != 0)
-				new_strsize += strlen(strings + n_strx) + 1;
+                                strx_map[strx_count++].old_strx = n_strx;
 			    new_nlocalsym++;
 			    new_nsyms++;
 			    saves[i] = new_nsyms;
@@ -3090,7 +3282,7 @@ uint32_t nextrefsyms)
 				   (n_type & N_TYPE) != N_SECT ||
 			   	   (s_flags & S_ATTR_STRIP_STATIC_SYMS) != 
 					      S_ATTR_STRIP_STATIC_SYMS){
-				    new_strsize += strlen(strings + n_strx) + 1;
+                                    strx_map[strx_count++].old_strx = n_strx;
 				    new_nlocalsym++;
 				    new_nsyms++;
 				    saves[i] = new_nsyms;
@@ -3107,7 +3299,8 @@ uint32_t nextrefsyms)
 			       private_extern_reference_by_module(
 				i, refs ,nextrefsyms) == TRUE){
 				if(n_strx != 0)
-				    new_strsize += strlen(strings + n_strx) + 1;
+				    //new_strsize += strlen(strings + n_strx) + 1;
+                                    strx_map[strx_count++].old_strx = n_strx;
 				new_nlocalsym++;
 				new_nsyms++;
 				saves[i] = new_nsyms;
@@ -3119,10 +3312,8 @@ uint32_t nextrefsyms)
 			    if(saves[i] == 0 &&
 			       symbol_pointer_used(i, indirectsyms,
 						   nindirectsyms) == TRUE){
-				if(n_strx != 0){
-				    len = strlen(strings + n_strx) + 1;
-				    new_strsize += len;
-				}
+				if(n_strx != 0)
+                                    strx_map[strx_count++].old_strx = n_strx;
 				new_nlocalsym++;
 				new_nsyms++;
 				saves[i] = new_nsyms;
@@ -3150,7 +3341,7 @@ uint32_t nextrefsyms)
 				sp->seen = TRUE;
 			    }
 			    if(n_strx != 0)
-				new_strsize += strlen(strings + n_strx) + 1;
+                                strx_map[strx_count++].old_strx = n_strx;
 			    new_nlocalsym++;
 			    new_nsyms++;
 			    saves[i] = new_nsyms;
@@ -3160,7 +3351,7 @@ uint32_t nextrefsyms)
 		       private_extern_reference_by_module(
 			i, refs ,nextrefsyms) == TRUE){
 			if(n_strx != 0)
-			    new_strsize += strlen(strings + n_strx) + 1;
+                            strx_map[strx_count++].old_strx = n_strx;
 			new_nlocalsym++;
 			new_nsyms++;
 			saves[i] = new_nsyms;
@@ -3172,10 +3363,8 @@ uint32_t nextrefsyms)
 		    if(saves[i] == 0 &&
 		       symbol_pointer_used(i, indirectsyms, nindirectsyms) ==
 									TRUE){
-			if(n_strx != 0){
-			    len = strlen(strings + n_strx) + 1;
-			    new_strsize += len;
-			}
+			if(n_strx != 0)
+                            strx_map[strx_count++].old_strx = n_strx;
 			new_nlocalsym++;
 			new_nsyms++;
 			saves[i] = new_nsyms;
@@ -3237,7 +3426,6 @@ uint32_t nextrefsyms)
 			    ".objc_class_name_",
 			    sizeof(".objc_class_name_") - 1) == 0))){
 		    len = strlen(strings + n_strx) + 1;
-		    new_strsize += len;
 		    new_ext_strsize += len;
 		    new_nextdefsym++;
 		    new_nsyms++;
@@ -3249,7 +3437,6 @@ uint32_t nextrefsyms)
 		    (n_type & N_TYPE) == N_PBUD)){
 		    if(n_strx != 0){
 			len = strlen(strings + n_strx) + 1;
-			new_strsize += len;
 			new_ext_strsize += len;
 		    }
 		    new_nundefsym++;
@@ -3260,7 +3447,6 @@ uint32_t nextrefsyms)
 		   (n_type & N_TYPE) == N_SECT){
 		    if(n_strx != 0){
 			len = strlen(strings + n_strx) + 1;
-			new_strsize += len;
 			new_ext_strsize += len;
 		    }
 		    new_nextdefsym++;
@@ -3287,7 +3473,6 @@ uint32_t nextrefsyms)
 				sp->sym = &(symbols64[i]);
 			    sp->seen = TRUE;
 			    len = strlen(strings + n_strx) + 1;
-			    new_strsize += len;
 			    new_ext_strsize += len;
 			    if((n_type & N_TYPE) == N_UNDF ||
 			       (n_type & N_TYPE) == N_PBUD)
@@ -3313,7 +3498,6 @@ uint32_t nextrefsyms)
 		   symbol_pointer_used(i, indirectsyms, nindirectsyms) == TRUE){
 		    if(n_strx != 0){
 			len = strlen(strings + n_strx) + 1;
-			new_strsize += len;
 			new_ext_strsize += len;
 		    }
 		    new_nextdefsym++;
@@ -3325,7 +3509,6 @@ uint32_t nextrefsyms)
 		   (n_desc & N_WEAK_DEF) != 0){
 		    if(n_strx != 0){
 			len = strlen(strings + n_strx) + 1;
-			new_strsize += len;
 			new_ext_strsize += len;
 		    }
 		    new_nextdefsym++;
@@ -3336,11 +3519,9 @@ uint32_t nextrefsyms)
 		   ((rflag || default_dyld_executable) &&
 		    n_desc & REFERENCED_DYNAMICALLY))){
 		    len = strlen(strings + n_strx) + 1;
-		    new_strsize += len;
 		    new_ext_strsize += len;
 		    if((n_type & N_TYPE) == N_INDR){
 			len = strlen(strings + n_value) + 1;
-			new_strsize += len;
 			new_ext_strsize += len;
 		    }
 		    if((n_type & N_TYPE) == N_UNDF ||
@@ -3363,11 +3544,9 @@ uint32_t nextrefsyms)
 		     object->mh->cputype == CPU_TYPE_I386 &&
 		     object->mh->filetype == MH_OBJECT))){
 		    len = strlen(strings + n_strx) + 1;
-		    new_strsize += len;
 		    new_ext_strsize += len;
 		    if((n_type & N_TYPE) == N_INDR){
 			len = strlen(strings + n_value) + 1;
-			new_strsize += len;
 			new_ext_strsize += len;
 		    }
 		    if((n_type & N_TYPE) == N_UNDF ||
@@ -3395,7 +3574,6 @@ uint32_t nextrefsyms)
 		return(FALSE);
 	    }
 	    len = strlen(strings + module_name) + 1;
-	    new_strsize += len;
 	    new_ext_strsize += len;
 	}
 
@@ -3436,7 +3614,6 @@ uint32_t nextrefsyms)
 			else
 			    n_strx = symbols64[refs[i].isym].n_un.n_strx;
 			len = strlen(strings + n_strx) + 1;
-			new_strsize += len;
 			new_ext_strsize += len;
 			new_nundefsym++;
 			new_nsyms++;
@@ -3502,6 +3679,41 @@ uint32_t nextrefsyms)
 	    }
 	}
 
+        /*
+         * preserve uniqued local symbol strings by sorting and uniqing the
+         * n_strx values in strx_map. If the linker or some previous tool has
+         * uniqued the strings, each n_strx represents a uniqued string.
+         *
+         * Note that strip currently will not unique local symbol strings
+         * itself. It simply preserves the uniqueness when deserializing and
+         * reserializing the strings table.
+         */
+        qsort(strx_map, strx_count, sizeof(*strx_map),
+              (int (*)(const void *, const void *))cmp_qsort_strx_map);
+        for (j = 0; j < strx_count; ++j) {
+            if (strx_map[strx_uniqcount].old_strx != strx_map[j].old_strx) {
+	      strx_uniqcount += 1;
+                if (strx_uniqcount < j) {
+                    strx_map[strx_uniqcount].old_strx = strx_map[j].old_strx;
+                }
+            }
+        }
+        if (strx_count > 0) {
+            strx_uniqcount += 1;
+        }
+    
+        /*
+         * compute the size of the local symbol strings by measuring each
+         * remaining string. new_strsize represents the total size of the
+         * strings table, so it will include the new_ext_strsize value. From
+         * this point forward, new_ext_strsize represents the beginning of the
+         * local symbol strings in the strings table.
+         */
+        for (i = 0; i < strx_uniqcount; ++i) {
+            new_strsize += strlen(strings + strx_map[i].old_strx) + 1;
+        }
+        new_strsize += new_ext_strsize;
+
 	/*
 	 * If there is a chance that we could end up with an indirect symbol
 	 * with an index of zero we need to avoid that due to a work around
@@ -3523,7 +3735,8 @@ uint32_t nextrefsyms)
 	 * table entry and a few bytes in the string table for the complexity it
 	 * would add and what it would save.
 	 */
-	if(new_nlocalsym == 0 && nindirectsyms != 0){
+	if(!strip_all_nlists &&
+	   (new_nlocalsym == 0 && nindirectsyms != 0)){
 	    len = strlen("radr://5614542") + 1;
 	    new_strsize += len;
 	    new_nlocalsym++;
@@ -3533,7 +3746,7 @@ uint32_t nextrefsyms)
 	else{
     	    hack_5614542 = FALSE;
 	}
-
+    
 	if(object->mh != NULL){
 	    new_symbols = (struct nlist *)
 			  allocate(new_nsyms * sizeof(struct nlist));
@@ -3564,6 +3777,11 @@ uint32_t nextrefsyms)
 	    new_strings[new_strsize - 1] = '\0';
 	}
 
+        /*
+         * Zero out the new_strings table, and calculate working pointers:
+         *   p is the location where the next external string will go
+         *   q is the location where the next local string will go
+         */
 	memset(new_strings, '\0', sizeof(int32_t));
 	p = new_strings + sizeof(int32_t);
 	q = p + new_ext_strsize;
@@ -3628,6 +3846,14 @@ uint32_t nextrefsyms)
 	    inew_syms++;
 	}
 
+        /*
+         * write the local symbol names into the strings table, keeping track
+         * of the new strx so we can preserve string uniqueness. Begin by
+         * finding the strx_map entry for each symbol's n_strx. If the strx_map
+         * entry does not yet have a strx value, copy the string into the
+         * strings table and compute the new strx value; if the strx_map does
+         * have a new strx value, simply reuse it and move on...
+         */
 	for(i = 0; i < nsyms; i++){
 	    if(saves[i]){
 		if(object->mh != NULL){
@@ -3644,14 +3870,29 @@ uint32_t nextrefsyms)
 		    else
 			new_symbols64[inew_syms] = symbols64[i];
 		    if(n_strx != 0){
-			strcpy(q, strings + n_strx);
-			if(object->mh != NULL)
-			    new_symbols[inew_syms].n_un.n_strx =
-				q - new_strings;
-			else
-			    new_symbols64[inew_syms].n_un.n_strx =
-				q - new_strings;
-			q += strlen(q) + 1;
+                        struct strx_map* map =
+                            bsearch(&n_strx, strx_map, strx_uniqcount,
+                                    sizeof(*strx_map),
+                                    (int(*)(const void*, const void*))
+                                    cmp_bsearch_strx_map);
+                        if (map != NULL) {
+                            if (map->new_strx == 0) {
+                                strcpy(q, strings + n_strx);
+                                map->new_strx = q - new_strings;
+                                q += strlen(q) + 1;
+                            }
+                            if(object->mh != NULL)
+                                new_symbols[inew_syms].n_un.n_strx =
+                                map->new_strx;
+                            else
+                                new_symbols64[inew_syms].n_un.n_strx =
+                                map->new_strx;
+                        }
+                        else {
+			    error_arch(arch, member, "n_strx %d is not in the "
+				       "local symbol table index: ", n_strx);
+			    return(FALSE);
+                        }
 		    }
 		    inew_syms++;
 		    saves[i] = inew_syms;
@@ -4012,9 +4253,10 @@ uint32_t nextrefsyms)
 	 * Update the export trie if it has one but only call the the
 	 * prune_trie() routine when we are removing global symbols as is
 	 * done with default stripping of a dyld executable or with the -s
-	 * or -R options.
+	 * or -R options.  If we are stripping nlist with the -N flag we must
+	 * leave the export trie as is.
 	 */
-	if(object->dyld_info != NULL &&
+	if(!strip_all_nlists && object->dyld_info != NULL &&
 	   object->dyld_info->export_size != 0 &&
 	   (default_dyld_executable || sfile != NULL || Rfile != NULL)){
 	    const char *error_string;
@@ -4042,6 +4284,8 @@ uint32_t nextrefsyms)
 	    free(sections);
 	if(sections64 != NULL)
 	    free(sections64);
+        if (strx_map != NULL)
+            free(strx_map);
 
 	if(errors == 0)
 	    return(TRUE);
@@ -4137,7 +4381,7 @@ struct object *object)
 	if((fd = open(input_file, O_WRONLY|O_CREAT, 0600)) < 0)
 	    system_fatal("can't open temporary file: %s", input_file);
 
-	if(write(fd, object->object_addr, object->object_size) !=
+	if(write64(fd, object->object_addr, object->object_size) !=
 	        object->object_size)
 	    system_fatal("can't write temporary file: %s", input_file);
 
@@ -4291,14 +4535,14 @@ struct object *object)
 	 * See if there are any LC_UUID load commands.
 	 */
 	nuuids = 0;
-	lc1 = arch->object->load_commands;
-        if(arch->object->mh != NULL){
-            ncmds = arch->object->mh->ncmds;
-	    mh_sizeofcmds = arch->object->mh->sizeofcmds;
+	lc1 = object->load_commands;
+        if(object->mh != NULL){
+            ncmds = object->mh->ncmds;
+	    mh_sizeofcmds = object->mh->sizeofcmds;
 	}
 	else{
-            ncmds = arch->object->mh64->ncmds;
-	    mh_sizeofcmds = arch->object->mh64->sizeofcmds;
+            ncmds = object->mh64->ncmds;
+	    mh_sizeofcmds = object->mh64->sizeofcmds;
 	}
 	for(i = 0; i < ncmds; i++){
 	    if(lc1->cmd == LC_UUID){
@@ -4321,7 +4565,7 @@ struct object *object)
 	 * Copy all the load commands except the LC_UUID load commands into the
 	 * allocated space for the new load commands.
 	 */
-	lc1 = arch->object->load_commands;
+	lc1 = object->load_commands;
 	lc2 = new_load_commands;
 	sizeofcmds = 0;
 	for(i = 0; i < ncmds; i++){
@@ -4337,41 +4581,41 @@ struct object *object)
 	 * Finally copy the updated load commands over the existing load
 	 * commands.
 	 */
-	memcpy(arch->object->load_commands, new_load_commands, sizeofcmds);
+	memcpy(object->load_commands, new_load_commands, sizeofcmds);
 	if(mh_sizeofcmds > sizeofcmds){
-		memset((char *)arch->object->load_commands + sizeofcmds, '\0', 
+		memset((char *)object->load_commands + sizeofcmds, '\0', 
 			   (mh_sizeofcmds - sizeofcmds));
 	}
 	ncmds -= nuuids;
-        if(arch->object->mh != NULL) {
-            arch->object->mh->sizeofcmds = sizeofcmds;
-            arch->object->mh->ncmds = ncmds;
+        if(object->mh != NULL) {
+            object->mh->sizeofcmds = sizeofcmds;
+            object->mh->ncmds = ncmds;
         } else {
-            arch->object->mh64->sizeofcmds = sizeofcmds;
-            arch->object->mh64->ncmds = ncmds;
+            object->mh64->sizeofcmds = sizeofcmds;
+            object->mh64->ncmds = ncmds;
         }
 	free(new_load_commands);
 
 	/* reset the pointers into the load commands */
-	lc1 = arch->object->load_commands;
+	lc1 = object->load_commands;
 	for(i = 0; i < ncmds; i++){
 	    switch(lc1->cmd){
 	    case LC_SYMTAB:
-		arch->object->st = (struct symtab_command *)lc1;
+		object->st = (struct symtab_command *)lc1;
 	        break;
 	    case LC_DYSYMTAB:
-		arch->object->dyst = (struct dysymtab_command *)lc1;
+		object->dyst = (struct dysymtab_command *)lc1;
 		break;
 	    case LC_TWOLEVEL_HINTS:
-		arch->object->hints_cmd = (struct twolevel_hints_command *)lc1;
+		object->hints_cmd = (struct twolevel_hints_command *)lc1;
 		break;
 	    case LC_PREBIND_CKSUM:
-		arch->object->cs = (struct prebind_cksum_command *)lc1;
+		object->cs = (struct prebind_cksum_command *)lc1;
 		break;
 	    case LC_SEGMENT:
 		sg = (struct segment_command *)lc1;
 		if(strcmp(sg->segname, SEG_LINKEDIT) == 0)
-		    arch->object->seg_linkedit = sg;
+		    object->seg_linkedit = sg;
 		break;
 	    case LC_SEGMENT_SPLIT_INFO:
 		object->split_info_cmd = (struct linkedit_data_command *)lc1;
@@ -4430,13 +4674,13 @@ struct object *object)
 	 * Allocate space for the new load commands as zero it out so any holes
 	 * will be zero bytes.
 	 */
-        if(arch->object->mh != NULL){
-            ncmds = arch->object->mh->ncmds;
-	    mh_sizeofcmds = arch->object->mh->sizeofcmds;
+        if(object->mh != NULL){
+            ncmds = object->mh->ncmds;
+	    mh_sizeofcmds = object->mh->sizeofcmds;
 	}
 	else{
-            ncmds = arch->object->mh64->ncmds;
-	    mh_sizeofcmds = arch->object->mh64->sizeofcmds;
+            ncmds = object->mh64->ncmds;
+	    mh_sizeofcmds = object->mh64->sizeofcmds;
 	}
 	new_load_commands = allocate(mh_sizeofcmds);
 	memset(new_load_commands, '\0', mh_sizeofcmds);
@@ -4445,7 +4689,7 @@ struct object *object)
 	 * Copy all the load commands except the LC_SEGMENT_SPLIT_INFO load
 	 * command into the allocated space for the new load commands.
 	 */
-	lc1 = arch->object->load_commands;
+	lc1 = object->load_commands;
 	lc2 = new_load_commands;
 	sizeofcmds = 0;
 	for(i = 0; i < ncmds; i++){
@@ -4461,42 +4705,42 @@ struct object *object)
 	 * Finally copy the updated load commands over the existing load
 	 * commands.
 	 */
-	memcpy(arch->object->load_commands, new_load_commands, sizeofcmds);
+	memcpy(object->load_commands, new_load_commands, sizeofcmds);
 	if(mh_sizeofcmds > sizeofcmds){
-		memset((char *)arch->object->load_commands + sizeofcmds, '\0', 
+		memset((char *)object->load_commands + sizeofcmds, '\0', 
 			   (mh_sizeofcmds - sizeofcmds));
 	}
 	ncmds -= 1;
-        if(arch->object->mh != NULL) {
-            arch->object->mh->sizeofcmds = sizeofcmds;
-            arch->object->mh->ncmds = ncmds;
+        if(object->mh != NULL) {
+            object->mh->sizeofcmds = sizeofcmds;
+            object->mh->ncmds = ncmds;
         } else {
-            arch->object->mh64->sizeofcmds = sizeofcmds;
-            arch->object->mh64->ncmds = ncmds;
+            object->mh64->sizeofcmds = sizeofcmds;
+            object->mh64->ncmds = ncmds;
         }
 	free(new_load_commands);
 
 	/* reset the pointers into the load commands */
 	object->split_info_cmd = NULL;
-	lc1 = arch->object->load_commands;
+	lc1 = object->load_commands;
 	for(i = 0; i < ncmds; i++){
 	    switch(lc1->cmd){
 	    case LC_SYMTAB:
-		arch->object->st = (struct symtab_command *)lc1;
+		object->st = (struct symtab_command *)lc1;
 	        break;
 	    case LC_DYSYMTAB:
-		arch->object->dyst = (struct dysymtab_command *)lc1;
+		object->dyst = (struct dysymtab_command *)lc1;
 		break;
 	    case LC_TWOLEVEL_HINTS:
-		arch->object->hints_cmd = (struct twolevel_hints_command *)lc1;
+		object->hints_cmd = (struct twolevel_hints_command *)lc1;
 		break;
 	    case LC_PREBIND_CKSUM:
-		arch->object->cs = (struct prebind_cksum_command *)lc1;
+		object->cs = (struct prebind_cksum_command *)lc1;
 		break;
 	    case LC_SEGMENT:
 		sg = (struct segment_command *)lc1;
 		if(strcmp(sg->segname, SEG_LINKEDIT) == 0)
-		    arch->object->seg_linkedit = sg;
+		    object->seg_linkedit = sg;
 		break;
 	    case LC_FUNCTION_STARTS:
 		object->func_starts_info_cmd =
@@ -4552,13 +4796,13 @@ struct object *object)
 	 * Allocate space for the new load commands and zero it out so any holes
 	 * will be zero bytes.
 	 */
-        if(arch->object->mh != NULL){
-            ncmds = arch->object->mh->ncmds;
-	    mh_sizeofcmds = arch->object->mh->sizeofcmds;
+        if(object->mh != NULL){
+            ncmds = object->mh->ncmds;
+	    mh_sizeofcmds = object->mh->sizeofcmds;
 	}
 	else{
-            ncmds = arch->object->mh64->ncmds;
-	    mh_sizeofcmds = arch->object->mh64->sizeofcmds;
+            ncmds = object->mh64->ncmds;
+	    mh_sizeofcmds = object->mh64->sizeofcmds;
 	}
 	new_load_commands = allocate(mh_sizeofcmds);
 	memset(new_load_commands, '\0', mh_sizeofcmds);
@@ -4567,7 +4811,7 @@ struct object *object)
 	 * Copy all the load commands except the LC_CODE_SIGNATURE load commands
 	 * into the allocated space for the new load commands.
 	 */
-	lc1 = arch->object->load_commands;
+	lc1 = object->load_commands;
 	lc2 = new_load_commands;
 	sizeofcmds = 0;
 	for(i = 0; i < ncmds; i++){
@@ -4583,42 +4827,42 @@ struct object *object)
 	 * Finally copy the updated load commands over the existing load
 	 * commands.
 	 */
-	memcpy(arch->object->load_commands, new_load_commands, sizeofcmds);
+	memcpy(object->load_commands, new_load_commands, sizeofcmds);
 	if(mh_sizeofcmds > sizeofcmds){
-		memset((char *)arch->object->load_commands + sizeofcmds, '\0', 
+		memset((char *)object->load_commands + sizeofcmds, '\0', 
 			   (mh_sizeofcmds - sizeofcmds));
 	}
 	ncmds -= 1;
-        if(arch->object->mh != NULL) {
-            arch->object->mh->sizeofcmds = sizeofcmds;
-            arch->object->mh->ncmds = ncmds;
+        if(object->mh != NULL) {
+            object->mh->sizeofcmds = sizeofcmds;
+            object->mh->ncmds = ncmds;
         } else {
-            arch->object->mh64->sizeofcmds = sizeofcmds;
-            arch->object->mh64->ncmds = ncmds;
+            object->mh64->sizeofcmds = sizeofcmds;
+            object->mh64->ncmds = ncmds;
         }
 	free(new_load_commands);
 
 	/* reset the pointers into the load commands */
 	object->code_sig_cmd = NULL;
-	lc1 = arch->object->load_commands;
+	lc1 = object->load_commands;
 	for(i = 0; i < ncmds; i++){
 	    switch(lc1->cmd){
 	    case LC_SYMTAB:
-		arch->object->st = (struct symtab_command *)lc1;
+		object->st = (struct symtab_command *)lc1;
 	        break;
 	    case LC_DYSYMTAB:
-		arch->object->dyst = (struct dysymtab_command *)lc1;
+		object->dyst = (struct dysymtab_command *)lc1;
 		break;
 	    case LC_TWOLEVEL_HINTS:
-		arch->object->hints_cmd = (struct twolevel_hints_command *)lc1;
+		object->hints_cmd = (struct twolevel_hints_command *)lc1;
 		break;
 	    case LC_PREBIND_CKSUM:
-		arch->object->cs = (struct prebind_cksum_command *)lc1;
+		object->cs = (struct prebind_cksum_command *)lc1;
 		break;
 	    case LC_SEGMENT:
 		sg = (struct segment_command *)lc1;
 		if(strcmp(sg->segname, SEG_LINKEDIT) == 0)
-		    arch->object->seg_linkedit = sg;
+		    object->seg_linkedit = sg;
 		break;
 	    case LC_SEGMENT_SPLIT_INFO:
 		object->split_info_cmd = (struct linkedit_data_command *)lc1;
@@ -4716,6 +4960,26 @@ uint32_t nindirectsyms)
 		return(TRUE);
 	}
 	return(FALSE);
+}
+
+/*
+ * Functions for comparing strx_map entries.
+ */
+static
+int
+cmp_qsort_strx_map(
+const struct strx_map* a,
+const struct strx_map* b)
+{
+    return a->old_strx - b->old_strx;
+}
+
+static
+int
+cmp_bsearch_strx_map(const uint32_t* old_strx,
+                     const struct strx_map *strx_map)
+{
+    return *old_strx - strx_map->old_strx;
 }
 
 /*

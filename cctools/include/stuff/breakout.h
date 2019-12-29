@@ -176,6 +176,10 @@ struct object {
     struct section_64 **sections64; /* array of 64-bit section structs */
     struct dyld_info_command
 	*dyld_info;		    /* the LC_DYLD_INFO command,if any */
+    struct linkedit_data_command
+	*dyld_chained_fixups;	    /* the fixups */
+    struct linkedit_data_command
+	*dyld_exports_trie;	    /* the exports trie */
 
     /*
      * This is only used for redo_prebinding and is calculated by breakout()
@@ -210,6 +214,11 @@ struct object {
     uint32_t      output_nsymbols;
     char	 *output_strings;
     uint32_t      output_strings_size;
+    /*
+     * To get the code signature data on a page alignment and be compatible with
+     * existing tools we have to actually change the string table and pad it.
+     */
+    uint32_t      output_strings_size_pad;
     char *output_code_sig_data;
     uint32_t      output_code_sig_data_size;
     char *output_split_info_data;

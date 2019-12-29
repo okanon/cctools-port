@@ -31,7 +31,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
@@ -110,7 +109,7 @@ private:
 	static void					parseWorkerThread(InputFiles *inputFiles);
 	void						startThread(void (*threadFunc)(InputFiles *)) const;
 
-	typedef std::unordered_map<const char*, ld::dylib::File*, CStringHash, CStringEquals>	InstallNameToDylib;
+	typedef std::map<std::string, ld::dylib::File*>	InstallNameToDylib;
 
 	const Options&				_options;
 	std::vector<ld::File*>		_inputFiles;

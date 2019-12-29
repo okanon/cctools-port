@@ -85,6 +85,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* cctools-port: For bcmp, bzero ... */
 #include <ctype.h>
 #include <libc.h>
 #include <dlfcn.h>
@@ -96,6 +97,7 @@
 #include "stuff/errors.h"
 #include "stuff/allocate.h"
 #include "stuff/guess_short_name.h"
+#include "stuff/write64.h"
 #ifdef LTO_SUPPORT
 #include "stuff/lto.h"
 #include <xar/xar.h>
@@ -501,7 +503,7 @@ struct ofile *ofile,
 char *arch_name,
 void *cookie)
 {
-    uint32_t ncmds, mh_flags;
+    uint32_t ncmds, mh_flags, mh_filetype;
     struct cmd_flags *cmd_flags;
     struct process_flags process_flags;
     uint32_t i, j, k;
@@ -562,10 +564,12 @@ void *cookie)
 	if(ofile->mh != NULL){
 	    ncmds = ofile->mh->ncmds;
 	    mh_flags = ofile->mh->flags;
+	    mh_filetype = ofile->mh->filetype;
 	}
 	else{
 	    ncmds = ofile->mh64->ncmds;
 	    mh_flags = ofile->mh64->flags;
+	    mh_filetype = ofile->mh64->filetype;
 	}
 	for(i = 0; i < ncmds; i++){
 	    if(st == NULL && lc->cmd == LC_SYMTAB){
@@ -669,6 +673,10 @@ void *cookie)
 		    for(j = 0; j < sg64->nsects; j++){
 			if(strcmp((s64 + j)->sectname, SECT_TEXT) == 0 &&
 			   strcmp((s64 + j)->segname, SEG_TEXT) == 0)
+			    process_flags.text_nsect = k + 1;
+			else if(mh_filetype == MH_KEXT_BUNDLE &&
+			   strcmp((s64 + j)->sectname, SECT_TEXT) == 0 &&
+			   strcmp((s64 + j)->segname, "__TEXT_EXEC") == 0)
 			    process_flags.text_nsect = k + 1;
 			else if(strcmp((s64 + j)->sectname, SECT_DATA) == 0 &&
 				strcmp((s64 + j)->segname, SEG_DATA) == 0)
@@ -1073,7 +1081,7 @@ struct cmd_flags *cmd_flags)
 	    return;
 
 	xar_fd = mkstemp(xar_filename);
-	if(write(xar_fd, llvm_bundle_pointer, llvm_bundle_size) !=
+	if(write64(xar_fd, llvm_bundle_pointer, llvm_bundle_size) !=
 	        llvm_bundle_size){
 	    if(ofile->xar_member_name != NULL)
 		system_error("Can't write (__LLVM,__bundle) section contents "
@@ -1873,7 +1881,7 @@ struct value_diff *value_diffs)
 		    else{
 			printf(" (indirect for ");
 			printf(ta_xfmt, symbols[i].nl.n_value);
-			printf(" %s)\n", symbols[i].indr_name);
+			printf(" %s)\n", symbols[i].nl.n_value + strings);
 		    }
 		}
 		else
