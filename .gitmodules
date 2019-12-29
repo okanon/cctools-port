@@ -1,3 +1,3 @@
 [submodule "usage_examples/ios_toolchain/iPhoneOS.sdk"]
 	path = usage_examples/ios_toolchain/iPhoneOS.sdk
-	url = git@github.com:okanon/iPhoneOS.sdk.git
+	url = https://github.com/okanon/iPhoneOS.sdk
